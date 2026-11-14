@@ -4,20 +4,31 @@
 # LCD I2C: SDA=21, SCL=22
 
 from machine import Pin, PWM, SoftI2C
+import network
+import urequests
+import ujson
 import dht
 import time
 
 # ─────────────────────────────────────────
 # KONSTANTA
 # ─────────────────────────────────────────
-SETPOINT      = 38.0  # °C suhu target inkubator
-DHT_PIN       = 4
-HEATER_PIN    = 14
-FAN_PIN       = 5
-SDA_PIN       = 21
-SCL_PIN       = 22
-PWM_FREQ      = 1000  # Hz
-LOOP_DELAY_MS = 2000  # 2 detik per siklus
+SETPOINT         = 38.0   # °C suhu target inkubator
+EMERGENCY_T      = 42.0   # °C hard cutoff keselamatan telur
+DHT_PIN          = 4
+HEATER_PIN       = 14
+FAN_PIN          = 5
+SDA_PIN          = 21
+SCL_PIN          = 22
+PWM_FREQ         = 1000   # Hz
+LOOP_DELAY_MS    = 2000   # ms per siklus
+PUSH_INTERVAL_MS = 5_000  # push ke Supabase tiap 5 detik
+PUSH_DELTA_T     = 0.3    # atau kalau suhu berubah > 0.3°C
+
+SUPABASE_URL = "https://touuqnnovbguxzffoyic.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRvdXVxbm5vdmJndXh6ZmZveWljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ2Mzg1NzAsImV4cCI6MjExMDIxNDU3MH0.IYz9emwcybuB6gYYsRM7C1XtJ_PSV7HBrky-hO7Qmy0"
+WIFI_SSID    = "Mawar1"
+WIFI_PASS    = "mawar119"
 
 # ─────────────────────────────────────────
 # INISIALISASI HARDWARE
@@ -39,11 +50,59 @@ except Exception as e:
     USE_LCD = False
 
 # ─────────────────────────────────────────
+# WIFI
+# ─────────────────────────────────────────
+
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if wlan.isconnected():
+        return True
+    print("Connecting WiFi...")
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+    timeout = 15
+    while not wlan.isconnected() and timeout > 0:
+        time.sleep(1)
+        timeout -= 1
+    if wlan.isconnected():
+        print(f"WiFi OK: {wlan.ifconfig()[0]}")
+        return True
+    print("[ERR] WiFi gagal")
+    return False
+
+# ─────────────────────────────────────────
+# SUPABASE
+# ─────────────────────────────────────────
+
+def push_to_supabase(temp, hum, pwm_h, pwm_f):
+    try:
+        payload = ujson.dumps({
+            "suhu"    : temp,
+            "humidity": hum,
+            "heater"  : pwm_h,
+            "fan"     : pwm_f,
+            "setpoint": SETPOINT
+        })
+        headers = {
+            "Content-Type" : "application/json",
+            "apikey"       : SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Prefer"       : "return=minimal"
+        }
+        r = urequests.post(
+            f"{SUPABASE_URL}/rest/v1/inkubator_log",
+            data=payload,
+            headers=headers
+        )
+        r.close()
+    except Exception as e:
+        print(f"[WARN] Supabase push gagal: {e}")
+
+# ─────────────────────────────────────────
 # FUZZY MEMBERSHIP FUNCTIONS
 # ─────────────────────────────────────────
 
-def trimf(x: float, a: float, b: float, c: float) -> float:
-    """Triangular membership function."""
+def trimf(x, a, b, c):
     if x <= a or x >= c:
         return 0.0
     if x == b:
@@ -52,8 +111,7 @@ def trimf(x: float, a: float, b: float, c: float) -> float:
         return (x - a) / (b - a)
     return (c - x) / (c - b)
 
-def trapmf(x: float, a: float, b: float, c: float, d: float) -> float:
-    """Trapezoidal membership function."""
+def trapmf(x, a, b, c, d):
     if x <= a or x >= d:
         return 0.0
     if b <= x <= c:
@@ -64,49 +122,41 @@ def trapmf(x: float, a: float, b: float, c: float, d: float) -> float:
 
 # ─────────────────────────────────────────
 # FUZZIFIKASI
-# Konvensi:
-#   Error POSITIF (+) = suhu KURANG dari setpoint → heater harus ON
-#   Error NEGATIF (-) = suhu LEBIH dari setpoint  → fan harus ON
+#
+# error = Setpoint - Suhu
+#   (+) → suhu KURANG → heater ON
+#   (-) → suhu LEBIH  → fan ON
+#
+# delta = error_sekarang - error_sebelumnya
+#   (+) → error membesar  → suhu makin jauh
+#   (-) → error mengecil  → suhu mendekati/melebihi setpoint
 # ─────────────────────────────────────────
 
-def fuzz_error(error: float) -> dict:
+def fuzz_error(error):
     return {
-        # error negatif besar = suhu jauh di ATAS setpoint → fan FULL
         "NB": trapmf(error, -6.0, -4.0, -3.0, -2.0),
         "NM": trimf (error, -3.0, -1.5,  0.0),
-        # mendekati setpoint
         "Z" : trimf (error, -1.0,  0.0,  1.0),
         "PM": trimf (error,  0.0,  1.5,  3.0),
-        # error positif besar = suhu jauh di BAWAH setpoint → heater FULL
         "PB": trapmf(error,  2.0,  3.0,  4.0,  6.0),
     }
 
-def fuzz_delta(delta: float) -> dict:
+def fuzz_delta(delta):
     return {
-        # delta negatif = error mengecil (suhu mendekati/melebihi setpoint)
-        "NF": trapmf(delta, -3.0, -1.5, -0.5,  0.0),
-        "Z" : trimf (delta, -0.5,  0.0,  0.5),
-        # delta positif = error membesar (suhu makin jauh dari setpoint)
-        "PF": trapmf(delta,  0.0,  0.5,  1.5,  3.0),
+        "NF": trapmf(delta, -3.0, -1.5, -0.3,  0.0),
+        "Z" : trimf (delta, -0.3,  0.0,  0.3),
+        "PF": trapmf(delta,  0.0,  0.3,  1.5,  3.0),
     }
 
 # ─────────────────────────────────────────
 # RULE BASE
-# (error_label, delta_label): (heater_level, fan_level)
 #
-# Heater level: 0=OFF(0), 1=LOW(50), 2=MED(128), 3=HIGH(192), 4=FULL(255)
-# Fan level   : 0=OFF(0), 1=LOW(80), 2=HIGH(255)
-#
-# Logika:
-#   PB (suhu jauh kurang)  → heater FULL, fan OFF
-#   PM (suhu agak kurang)  → heater HIGH, fan OFF/LOW
-#   Z  (suhu tepat)        → heater LOW,  fan LOW (sirkulasi)
-#   NM (suhu agak lebih)   → heater OFF,  fan HIGH
-#   NB (suhu jauh lebih)   → heater OFF,  fan FULL
+# Heater: 0=OFF(0)  1=LOW(50)  2=MED(128)  3=HIGH(192)  4=FULL(255)
+# Fan   : 0=OFF(0)  1=LOW(80)  2=HIGH(255)
 # ─────────────────────────────────────────
 
 RULES = {
-    # Suhu jauh KURANG → heater FULL, jangan buang panas
+    # Suhu jauh KURANG → heater FULL, fan OFF
     ("PB", "PF"): (4, 0),
     ("PB", "Z" ): (4, 0),
     ("PB", "NF"): (3, 0),
@@ -114,12 +164,12 @@ RULES = {
     # Suhu agak KURANG
     ("PM", "PF"): (3, 0),
     ("PM", "Z" ): (3, 0),
-    ("PM", "NF"): (2, 1),  # mulai sirkulasi ringan
+    ("PM", "NF"): (1, 2),  # naik cepat → potong heater, fan bantu
 
-    # Suhu TEPAT di setpoint → heater low, fan sirkulasi
-    ("Z",  "PF"): (2, 1),
-    ("Z",  "Z" ): (1, 1),  # stabil → heater low, fan tetap sirkulasi
-    ("Z",  "NF"): (0, 1),
+    # Suhu TEPAT
+    ("Z",  "PF"): (1, 1),  # masih naik → heater rendah
+    ("Z",  "Z" ): (1, 1),  # stabil → heater low, fan sirkulasi
+    ("Z",  "NF"): (0, 1),  # turun → heater off, pantau
 
     # Suhu agak LEBIH → heater off, fan buang panas
     ("NM", "PF"): (1, 1),
@@ -132,7 +182,6 @@ RULES = {
     ("NB", "NF"): (0, 2),
 }
 
-# Mapping level → nilai PWM aktual
 HEATER_PWM = {0: 0, 1: 50, 2: 128, 3: 192, 4: 255}
 FAN_PWM    = {0: 0, 1: 80, 2: 255}
 
@@ -140,7 +189,7 @@ FAN_PWM    = {0: 0, 1: 80, 2: 255}
 # FUZZY INFERENCE — Mamdani + COG defuzzifikasi
 # ─────────────────────────────────────────
 
-def fuzzy_inference(error: float, delta: float) -> tuple:
+def fuzzy_inference(error, delta):
     mu_e = fuzz_error(error)
     mu_d = fuzz_delta(delta)
 
@@ -151,7 +200,6 @@ def fuzzy_inference(error: float, delta: float) -> tuple:
         strength = min(mu_e.get(el, 0.0), mu_d.get(dl, 0.0))
         if strength <= 0.0:
             continue
-
         heater_num += strength * HEATER_PWM[hl]
         heater_den += strength
         fan_num    += strength * FAN_PWM[fl]
@@ -164,13 +212,11 @@ def fuzzy_inference(error: float, delta: float) -> tuple:
 
 # ─────────────────────────────────────────
 # PROTEKSI OVERTEMPERATURE
-# Hard cutoff independen dari fuzzy
 # ─────────────────────────────────────────
 
-def emergency_cutoff(temp: float, pwm_h: int, pwm_f: int) -> tuple:
-    """Matikan heater paksa jika suhu >= 42°C untuk keselamatan telur."""
-    if temp >= 42.0:
-        print(f"[EMERGENCY] Suhu {temp:.1f}C! Heater dimatikan paksa.")
+def emergency_cutoff(temp, pwm_h, pwm_f):
+    if temp >= EMERGENCY_T:
+        print(f"[EMERGENCY] Suhu {temp:.1f}C >= {EMERGENCY_T}C! Heater dimatikan.")
         return 0, 255
     return pwm_h, pwm_f
 
@@ -178,7 +224,7 @@ def emergency_cutoff(temp: float, pwm_h: int, pwm_f: int) -> tuple:
 # LCD HELPER
 # ─────────────────────────────────────────
 
-def update_lcd(temp: float, hum: float, pwm_h: int, pwm_f: int):
+def update_lcd(temp, hum, pwm_h, pwm_f):
     if not USE_LCD:
         return
     try:
@@ -190,34 +236,47 @@ def update_lcd(temp: float, hum: float, pwm_h: int, pwm_f: int):
         print(f"[LCD ERR] {e}")
 
 # ─────────────────────────────────────────
+# FAN DEAD-BAND
+# ─────────────────────────────────────────
+
+def apply_fan(pwm_f):
+    MIN_FAN_PWM = 60
+    if 0 < pwm_f < MIN_FAN_PWM:
+        pwm_f = 0
+    fan.duty(pwm_f)
+
+# ─────────────────────────────────────────
 # MAIN LOOP
 # ─────────────────────────────────────────
 
 def main():
-    error      = 0.0
-    prev_error = 0.0
+    error          = 0.0
+    prev_error     = 0.0
+    last_push_ms   = 0
+    last_push_temp = 0.0
 
-    print("=" * 40)
-    print(" Inkubator Telur — Fuzzy Logic Control")
-    print(f" Setpoint : {SETPOINT}C")
-    print(f" Emergency: 42.0C")
-    print("=" * 40)
+    connect_wifi()
+
+    print("=" * 42)
+    print("  Inkubator Telur — Fuzzy Logic Control")
+    print(f"  Setpoint : {SETPOINT}C")
+    print(f"  Emergency: {EMERGENCY_T}C")
+    print("=" * 42)
 
     while True:
-        # 1. Baca sensor DHT22
+        # 1. Baca sensor
         try:
             sensor.measure()
             temp = sensor.temperature()
             hum  = sensor.humidity()
         except OSError as e:
             print(f"[ERR] Gagal baca DHT22: {e}")
-            # Matikan heater saat sensor error — fail-safe
             heater.duty(0)
-            fan.duty(80)
+            apply_fan(80)
             time.sleep_ms(LOOP_DELAY_MS)
             continue
 
-        # 2. Hitung error & delta error
+        # 2. Hitung error & delta
         prev_error = error
         error      = SETPOINT - temp
         delta      = error - prev_error
@@ -230,9 +289,19 @@ def main():
 
         # 5. Aktuasi
         heater.duty(pwm_h)
-        fan.duty(pwm_f)
+        apply_fan(pwm_f)
 
-        # 6. Output
+        # 6. Push ke Supabase (tiap 5s atau delta suhu > 0.3°C)
+        now_ms      = time.ticks_ms()
+        interval_ok = time.ticks_diff(now_ms, last_push_ms) >= PUSH_INTERVAL_MS
+        delta_ok    = abs(temp - last_push_temp) >= PUSH_DELTA_T
+
+        if interval_ok or delta_ok:
+            push_to_supabase(temp, hum, pwm_h, pwm_f)
+            last_push_ms   = now_ms
+            last_push_temp = temp
+
+        # 7. Log
         update_lcd(temp, hum, pwm_h, pwm_f)
         print(
             f"[{time.ticks_ms() // 1000:6d}s] "
