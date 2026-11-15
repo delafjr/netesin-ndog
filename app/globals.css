@@ -1,15 +1,21 @@
 @import "tailwindcss";
 
 :root {
-  --background: #0f172a;
-  --foreground: #e2e8f0;
-  --card: #1e293b;
-  --card-border: #334155;
-  --accent: #f59e0b;
-  --accent-red: #ef4444;
-  --accent-blue: #3b82f6;
-  --accent-green: #22c55e;
-  --muted: #94a3b8;
+  --background: #faf7f2;
+  --foreground: #2d2520;
+  --brown: #8b5e3c;
+  --brown-light: #c4956a;
+  --brown-pale: #e8d5c0;
+  --brown-bg: rgba(139, 94, 60, 0.08);
+  --brown-border: rgba(139, 94, 60, 0.18);
+  --amber: #d47c2e;
+  --amber-bg: rgba(212, 124, 46, 0.08);
+  --warm-red: #c0392b;
+  --warm-red-bg: rgba(192, 57, 43, 0.08);
+  --teal: #2e7d6b;
+  --teal-bg: rgba(46, 125, 107, 0.08);
+  --card-bg: #ffffff;
+  --muted: #9a8e82;
 }
 
 @theme inline {
@@ -22,5 +28,18 @@
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans), "Segoe UI", Arial, sans-serif;
 }
+
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--brown-pale); border-radius: 999px; }
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.fade-up   { animation: fadeUp 0.45s ease-out both; }
+.fade-up-1 { animation: fadeUp 0.45s ease-out 0.1s both; }
+.fade-up-2 { animation: fadeUp 0.45s ease-out 0.2s both; }

@@ -1,603 +1,548 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import type { InkubatorLog } from "./lib/supabase";
+import { supabase, type InkubatorLog } from "./utils/supabase";
 
-/* ── helpers ─────────────────────────────────────── */
-function Gauge({
-  label,
-  value,
-  max,
-  unit,
-  color,
-}: {
-  label: string;
-  value: number;
-  max: number;
-  unit: string;
-  color: string;
-}) {
-  const pct = Math.min((value / max) * 100, 100);
+// ─── Fuzzy knowledge ───────────────────────────────────────────────
+const RULES = [
+  { error: "PB", delta: "PF", heater: "FULL (255)", fan: "OFF (0)",   hColor: "#c0392b", fColor: "#9a8e82" },
+  { error: "PB", delta: "Z",  heater: "FULL (255)", fan: "OFF (0)",   hColor: "#c0392b", fColor: "#9a8e82" },
+  { error: "PB", delta: "NF", heater: "HIGH (192)", fan: "OFF (0)",   hColor: "#d47c2e", fColor: "#9a8e82" },
+  { error: "PM", delta: "PF", heater: "HIGH (192)", fan: "OFF (0)",   hColor: "#d47c2e", fColor: "#9a8e82" },
+  { error: "PM", delta: "Z",  heater: "HIGH (192)", fan: "OFF (0)",   hColor: "#d47c2e", fColor: "#9a8e82" },
+  { error: "PM", delta: "NF", heater: "LOW (50)",   fan: "HIGH (255)",hColor: "#8b5e3c", fColor: "#2e7d6b" },
+  { error: "Z",  delta: "PF", heater: "LOW (50)",   fan: "LOW (80)",  hColor: "#8b5e3c", fColor: "#2e7d6b" },
+  { error: "Z",  delta: "Z",  heater: "LOW (50)",   fan: "LOW (80)",  hColor: "#8b5e3c", fColor: "#2e7d6b" },
+  { error: "Z",  delta: "NF", heater: "OFF (0)",    fan: "LOW (80)",  hColor: "#9a8e82", fColor: "#2e7d6b" },
+  { error: "NM", delta: "PF", heater: "LOW (50)",   fan: "LOW (80)",  hColor: "#8b5e3c", fColor: "#2e7d6b" },
+  { error: "NM", delta: "Z",  heater: "OFF (0)",    fan: "HIGH (255)",hColor: "#9a8e82", fColor: "#2e7d6b" },
+  { error: "NM", delta: "NF", heater: "OFF (0)",    fan: "HIGH (255)",hColor: "#9a8e82", fColor: "#2e7d6b" },
+  { error: "NB", delta: "PF", heater: "OFF (0)",    fan: "HIGH (255)",hColor: "#9a8e82", fColor: "#2e7d6b" },
+  { error: "NB", delta: "Z",  heater: "OFF (0)",    fan: "HIGH (255)",hColor: "#9a8e82", fColor: "#2e7d6b" },
+  { error: "NB", delta: "NF", heater: "OFF (0)",    fan: "HIGH (255)",hColor: "#9a8e82", fColor: "#2e7d6b" },
+];
+
+const ERROR_MF = [
+  { label: "NB", name: "Negative Big",    desc: "Suhu jauh LEBIH dari setpoint",  fn: "trapmf(−8, −5, −3, −2)" },
+  { label: "NM", name: "Negative Medium", desc: "Suhu agak LEBIH dari setpoint",  fn: "trimf(−3, −1.5, 0)"     },
+  { label: "Z",  name: "Zero",            desc: "Suhu TEPAT di setpoint",          fn: "trimf(−1, 0, 1)"        },
+  { label: "PM", name: "Positive Medium", desc: "Suhu agak KURANG dari setpoint",  fn: "trimf(0, 1.5, 3)"       },
+  { label: "PB", name: "Positive Big",    desc: "Suhu jauh KURANG dari setpoint",  fn: "trapmf(2, 3, 5, 8)"     },
+];
+
+const DELTA_MF = [
+  { label: "NF", name: "Negative Fast", desc: "Error mengecil — suhu mendekati SP", fn: "trapmf(−3, −1.5, −0.3, 0)" },
+  { label: "Z",  name: "Zero",          desc: "Error stabil",                        fn: "trimf(−0.3, 0, 0.3)"       },
+  { label: "PF", name: "Positive Fast", desc: "Error membesar — suhu menjauhi SP",   fn: "trapmf(0, 0.3, 1.5, 3)"    },
+];
+
+// ─── Helpers ───────────────────────────────────────────────────────
+function PwmBar({ value, max = 255, color }: { value: number; max?: number; color: string }) {
   return (
-    <div className="flex flex-col gap-1">
-      <div className="flex justify-between text-sm">
-        <span className="text-[var(--muted)]">{label}</span>
-        <span className="font-mono font-bold" style={{ color }}>
-          {value.toFixed(1)}
-          {unit}
-        </span>
+    <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: "rgba(0,0,0,0.06)" }}>
+      <div
+        className="h-full rounded-full transition-all duration-700"
+        style={{ width: `${Math.min((value / max) * 100, 100)}%`, background: color }}
+      />
+    </div>
+  );
+}
+
+function StatusPing({ ok }: { ok: boolean }) {
+  return (
+    <span className="relative flex h-2.5 w-2.5 flex-shrink-0">
+      {ok && <span className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-60" style={{ background: "#2e7d6b" }} />}
+      <span className="relative inline-flex h-2.5 w-2.5 rounded-full" style={{ background: ok ? "#2e7d6b" : "#9a8e82" }} />
+    </span>
+  );
+}
+
+const TABS = [
+  { key: "dashboard", label: "Dashboard" },
+  { key: "fuzzy",     label: "Fuzzy Logic" },
+  { key: "riwayat",   label: "Riwayat" },
+] as const;
+type Tab = typeof TABS[number]["key"];
+
+// ─── Dummy data saat tabel kosong / ESP32 belum nyala ──────────────
+function makeDummy(): InkubatorLog[] {
+  const now = Date.now();
+  return Array.from({ length: 20 }, (_, i) => ({
+    id: i + 1,
+    created_at: new Date(now - i * 5000).toISOString(),
+    suhu:     +(37.2 + Math.sin(i * 0.5) * 1.2).toFixed(1),
+    humidity: +(68 + Math.cos(i * 0.4) * 5).toFixed(1),
+    heater:   i % 3 === 0 ? 192 : i % 3 === 1 ? 50 : 0,
+    fan:      i % 3 === 0 ? 0   : i % 3 === 1 ? 80 : 255,
+    setpoint: 38,
+  }));
+}
+
+// ─── Riwayat Tab (state sendiri) ───────────────────────────────────
+function RiwayatTab() {
+  const today = new Date().toISOString().slice(0, 10);
+  const [startDate, setStartDate] = useState(today);
+  const [endDate,   setEndDate]   = useState(today);
+  const [rows,      setRows]      = useState<InkubatorLog[]>([]);
+  const [loading,   setLoading]   = useState(true);
+
+  const fetch50 = useCallback(async (start: string, end: string) => {
+    setLoading(true);
+    const startISO = new Date(start + "T00:00:00+07:00").toISOString();
+    const endISO   = new Date(end   + "T23:59:59+07:00").toISOString();
+    const { data } = await supabase
+      .from("inkubator_log")
+      .select("*")
+      .gte("created_at", startISO)
+      .lte("created_at", endISO)
+      .order("created_at", { ascending: false })
+      .limit(50);
+    setRows(data ?? []);
+    setLoading(false);
+  }, []);
+
+  // load default on mount
+  useEffect(() => { fetch50(today, today); }, [fetch50, today]);
+
+  const temps = rows.map(r => r.suhu).filter(Boolean);
+  const hums  = rows.map(r => r.humidity).filter(Boolean);
+
+  return (
+    <div className="space-y-5">
+      <div className="fade-up">
+        <h1 className="text-3xl font-bold tracking-tight" style={{ color: "var(--foreground)" }}>
+          Riwayat <span style={{ color: "var(--brown)" }}>Data</span>
+        </h1>
+        <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
+          Maks 50 data per rentang · default hari ini
+        </p>
       </div>
-      <div className="h-2 rounded-full bg-[var(--card-border)] overflow-hidden">
-        <div
-          className="h-full rounded-full transition-all duration-700"
-          style={{ width: `${pct}%`, background: color }}
-        />
+
+      {/* Date filter */}
+      <div className="rounded-3xl p-5 fade-up"
+        style={{ background: "var(--card-bg)", border: "1px solid var(--brown-border)" }}>
+        <div className="flex flex-col sm:flex-row gap-3 items-end">
+          <div className="flex-1">
+            <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: "var(--muted)" }}>Dari</label>
+            <input type="date" value={startDate}
+              onChange={e => setStartDate(e.target.value)}
+              className="w-full px-4 py-2.5 rounded-xl text-sm outline-none transition-all"
+              style={{ background: "var(--brown-bg)", border: "1px solid var(--brown-border)", color: "var(--foreground)" }} />
+          </div>
+          <div className="flex-1">
+            <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: "var(--muted)" }}>Sampai</label>
+            <input type="date" value={endDate}
+              onChange={e => setEndDate(e.target.value)}
+              className="w-full px-4 py-2.5 rounded-xl text-sm outline-none transition-all"
+              style={{ background: "var(--brown-bg)", border: "1px solid var(--brown-border)", color: "var(--foreground)" }} />
+          </div>
+          <button
+            onClick={() => fetch50(startDate, endDate)}
+            disabled={loading}
+            className="px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition-all hover:-translate-y-0.5 disabled:opacity-50"
+            style={{ background: "linear-gradient(135deg, #8b5e3c, #c4956a)", boxShadow: "0 2px 10px rgba(139,94,60,0.35)" }}>
+            {loading ? "..." : "Tampilkan"}
+          </button>
+        </div>
+      </div>
+
+      {/* Stats */}
+      {rows.length > 0 && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 fade-up-1">
+          {[
+            { label: "Suhu Min",  value: temps.length ? `${Math.min(...temps).toFixed(1)}°C` : "-", color: "#2e7d6b" },
+            { label: "Suhu Maks", value: temps.length ? `${Math.max(...temps).toFixed(1)}°C` : "-", color: "#c0392b" },
+            { label: "Hum Min",   value: hums.length  ? `${Math.min(...hums).toFixed(1)}%`   : "-", color: "#2e7d6b" },
+            { label: "Hum Maks",  value: hums.length  ? `${Math.max(...hums).toFixed(1)}%`   : "-", color: "#d47c2e" },
+          ].map(s => (
+            <div key={s.label} className="rounded-2xl p-4 text-center"
+              style={{ background: "var(--card-bg)", border: "1px solid var(--brown-border)" }}>
+              <p className="text-xs uppercase tracking-wider" style={{ color: "var(--muted)" }}>{s.label}</p>
+              <p className="text-xl font-bold mt-1" style={{ color: s.color }}>{s.value}</p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Table */}
+      <div className="rounded-3xl overflow-hidden fade-up-2"
+        style={{ background: "var(--card-bg)", border: "1px solid var(--brown-border)", boxShadow: "0 4px 24px var(--brown-bg)" }}>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs uppercase tracking-wider"
+              style={{ color: "var(--muted)", borderBottom: "1px solid var(--brown-border)", background: "var(--brown-bg)" }}>
+              <th className="px-5 py-3">Waktu</th>
+              <th className="px-5 py-3">Suhu</th>
+              <th className="px-5 py-3">Humidity</th>
+              <th className="px-5 py-3">Heater</th>
+              <th className="px-5 py-3">Fan</th>
+              <th className="px-5 py-3">Setpoint</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && (
+              <tr><td colSpan={6} className="text-center py-12" style={{ color: "var(--muted)" }}>Memuat...</td></tr>
+            )}
+            {!loading && rows.length === 0 && (
+              <tr><td colSpan={6} className="text-center py-12" style={{ color: "var(--muted)" }}>
+                Tidak ada data di rentang tanggal ini.
+              </td></tr>
+            )}
+            {rows.map((l, i) => (
+              <tr key={l.id}
+                style={{ borderTop: "1px solid rgba(139,94,60,0.07)", background: i % 2 === 1 ? "rgba(139,94,60,0.02)" : undefined }}>
+                <td className="px-5 py-3 font-mono text-xs" style={{ color: "var(--muted)" }}>
+                  {new Date(l.created_at).toLocaleString("id-ID", { timeZone: "Asia/Jakarta", hour12: false })}
+                </td>
+                <td className="px-5 py-3 font-semibold" style={{ color: "#c0392b" }}>{l.suhu?.toFixed(1)}°C</td>
+                <td className="px-5 py-3 font-semibold" style={{ color: "#2e7d6b" }}>{l.humidity?.toFixed(1)}%</td>
+                <td className="px-5 py-3 font-mono">{l.heater}</td>
+                <td className="px-5 py-3 font-mono">{l.fan}</td>
+                <td className="px-5 py-3 font-mono" style={{ color: "var(--muted)" }}>{l.setpoint}°C</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {rows.length > 0 && (
+          <p className="px-5 py-2.5 text-xs" style={{ color: "var(--muted)", borderTop: "1px solid var(--brown-border)" }}>
+            Menampilkan {rows.length} data
+          </p>
+        )}
       </div>
     </div>
   );
 }
 
-function StatusDot({ ok }: { ok: boolean }) {
-  return (
-    <span
-      className={`inline-block w-2.5 h-2.5 rounded-full ${ok ? "bg-[var(--accent-green)] animate-pulse" : "bg-[var(--accent-red)]"}`}
-    />
-  );
-}
-
-/* ── fuzzy knowledge tables ──────────────────────── */
-
-const MEMBERSHIP_ERROR = [
-  ["NB", "Negative Big", "Suhu jauh di atas setpoint", "trapmf(-8, -5, -3, -2)"],
-  ["NM", "Negative Medium", "Suhu agak di atas setpoint", "trimf(-3, -1.5, 0)"],
-  ["Z", "Zero", "Suhu tepat di setpoint", "trimf(-1, 0, 1)"],
-  ["PM", "Positive Medium", "Suhu agak di bawah setpoint", "trimf(0, 1.5, 3)"],
-  ["PB", "Positive Big", "Suhu jauh di bawah setpoint", "trapmf(2, 3, 5, 8)"],
-];
-
-const MEMBERSHIP_DELTA = [
-  ["NF", "Negative Fast", "Error mengecil (suhu mendekati/melewati SP)", "trapmf(-3, -1.5, -0.3, 0)"],
-  ["Z", "Zero", "Error stabil", "trimf(-0.3, 0, 0.3)"],
-  ["PF", "Positive Fast", "Error membesar (suhu menjauhi SP)", "trapmf(0, 0.3, 1.5, 3)"],
-];
-
-const RULE_TABLE = [
-  ["", "NF", "Z", "PF"],
-  ["PB", "H3 F0", "H4 F0", "H4 F0"],
-  ["PM", "H1 F2", "H3 F0", "H3 F0"],
-  ["Z", "H0 F1", "H1 F1", "H1 F1"],
-  ["NM", "H0 F2", "H0 F2", "H1 F1"],
-  ["NB", "H0 F2", "H0 F2", "H0 F2"],
-];
-
-const PWM_MAP = [
-  ["Heater Level", "0=OFF (0)", "1=LOW (50)", "2=MED (128)", "3=HIGH (192)", "4=FULL (255)"],
-  ["Fan Level", "0=OFF (0)", "1=LOW (80)", "2=HIGH (255)", "", ""],
-];
-
-/* ── main page ───────────────────────────────────── */
-
+// ─── Page ──────────────────────────────────────────────────────────
 export default function Home() {
-  const [latest, setLatest] = useState<InkubatorLog | null>(null);
-  const [logs, setLogs] = useState<InkubatorLog[]>([]);
+  const [tab, setTab]         = useState<Tab>("dashboard");
+  const [logs, setLogs]       = useState<InkubatorLog[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<"dashboard" | "fuzzy" | "firmware">("dashboard");
+  const [error, setError]     = useState<string | null>(null);
+  const [isDummy, setIsDummy] = useState(false);
 
-  const load = useCallback(async () => {
-    try {
-      const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-      const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-      const h = { apikey: key, Authorization: `Bearer ${key}` };
+  const fetchData = useCallback(async () => {
+    const { data, error: err } = await supabase
+      .from("inkubator_log")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(100);
 
-      const [latestRes, logsRes] = await Promise.all([
-        fetch(`${url}/rest/v1/inkubator_log?order=created_at.desc&limit=1`, {
-          headers: h,
-          cache: "no-store",
-        }),
-        fetch(`${url}/rest/v1/inkubator_log?order=created_at.desc&limit=50`, {
-          headers: h,
-          cache: "no-store",
-        }),
-      ]);
-
-      if (latestRes.ok) {
-        const d = await latestRes.json();
-        setLatest(d[0] ?? null);
-      }
-      if (logsRes.ok) {
-        setLogs(await logsRes.json());
-      }
+    if (err || !data || data.length === 0) {
+      // jangan replace kalau sudah ada data real sebelumnya
+      setLogs((prev) => (prev.length && !isDummy ? prev : makeDummy()));
+      setIsDummy(true);
+      setError(
+        err
+          ? "Tabel belum dibuat di Supabase — tampil data contoh."
+          : "ESP32 belum push data — tampil data contoh."
+      );
+    } else {
+      setLogs(data);
+      setIsDummy(false);
       setError(null);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Fetch error");
-    } finally {
-      setLoading(false);
     }
+    setLoading(false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    load();
-    const iv = setInterval(load, 5000);
+    fetchData();
+    const iv = setInterval(fetchData, 5000);
     return () => clearInterval(iv);
-  }, [load]);
+  }, [fetchData]);
 
-  const isOnline =
-    !!latest &&
-    Date.now() - new Date(latest.created_at).getTime() < 30_000;
+  const latest  = logs[0] ?? null;
+  const isOnline = !!latest && Date.now() - new Date(latest.created_at).getTime() < 30_000;
+
+  const SETPOINT   = latest?.setpoint ?? 38;
+  const EMERGENCY  = 42;
+  const temp       = latest?.suhu      ?? 0;
+  const hum        = latest?.humidity  ?? 0;
+  const heaterPwm  = latest?.heater    ?? 0;
+  const fanPwm     = latest?.fan       ?? 0;
+  const error_val  = SETPOINT - temp;
+
+  // derive fuzzy region for active rule highlight
+  const eZone = error_val > 2 ? "PB" : error_val > 0 ? "PM" : error_val > -1 ? "Z" : error_val > -3 ? "NM" : "NB";
 
   return (
-    <main className="max-w-5xl mx-auto px-4 py-8 flex flex-col gap-6">
-      {/* Header */}
-      <header className="flex items-center gap-3">
-        <span className="text-3xl">🐣</span>
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">
-            Inkubator Telur — Fuzzy Logic
-          </h1>
-          <p className="text-sm text-[var(--muted)]">
-            ESP32 · DHT22 · MX1508 · Mamdani Inference
-          </p>
-        </div>
-        <div className="ml-auto flex items-center gap-2 text-sm">
-          <StatusDot ok={isOnline} />
-          <span className="text-[var(--muted)]">
-            {isOnline ? "Online" : "Offline"}
-          </span>
-        </div>
-      </header>
+    <div className="min-h-screen" style={{ background: "var(--background)" }}>
 
-      {/* Tabs */}
-      <nav className="flex gap-1 bg-[var(--card)] rounded-lg p-1 w-fit">
-        {(["dashboard", "fuzzy", "firmware"] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
-              tab === t
-                ? "bg-[var(--accent)] text-[var(--background)]"
-                : "text-[var(--muted)] hover:text-[var(--foreground)]"
-            }`}
-          >
-            {t === "dashboard"
-              ? "📊 Dashboard"
-              : t === "fuzzy"
-                ? "🧠 Fuzzy Logic"
-                : "⚡ Firmware"}
-          </button>
-        ))}
+      {/* ── Nav ──────────────────────────────────────────── */}
+      <nav className="w-full max-w-5xl mx-auto px-6 py-5 flex items-center justify-between fade-up">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl flex items-center justify-center text-white text-lg"
+            style={{ background: "linear-gradient(135deg, #8b5e3c, #c4956a)" }}>
+            🥚
+          </div>
+          <div>
+            <p className="font-bold text-base leading-tight" style={{ color: "var(--foreground)" }}>Inkubator Telur</p>
+            <p className="text-xs" style={{ color: "var(--muted)" }}>Fuzzy Logic Control · ESP32</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1 p-1 rounded-full" style={{ background: "var(--brown-bg)", border: "1px solid var(--brown-border)" }}>
+          {TABS.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-250"
+              style={{
+                background: tab === t.key ? "linear-gradient(135deg, #8b5e3c, #c4956a)" : "transparent",
+                color:      tab === t.key ? "#fff" : "var(--muted)",
+                boxShadow:  tab === t.key ? "0 2px 10px rgba(139,94,60,0.35)" : "none",
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
       </nav>
 
-      {loading && (
-        <div className="text-center py-20 text-[var(--muted)]">
-          Memuat data...
-        </div>
-      )}
-      {error && (
-        <div className="bg-red-900/30 border border-red-700 text-red-300 rounded-lg px-4 py-3 text-sm">
-          {error}
-        </div>
-      )}
+      <main className="max-w-5xl mx-auto px-6 pb-16 space-y-6">
 
-      {/* ── DASHBOARD ──────────────────────────── */}
-      {tab === "dashboard" && !loading && (
-        <>
-          {/* Cards */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {[
-              {
-                label: "Suhu",
-                val: latest?.suhu ?? 0,
-                unit: "°C",
-                color: "var(--accent-red)",
-              },
-              {
-                label: "Humidity",
-                val: latest?.humidity ?? 0,
-                unit: "%",
-                color: "var(--accent-blue)",
-              },
-              {
-                label: "Heater PWM",
-                val: latest?.heater ?? 0,
-                unit: "",
-                color: "var(--accent)",
-              },
-              {
-                label: "Fan PWM",
-                val: latest?.fan ?? 0,
-                unit: "",
-                color: "var(--accent-green)",
-              },
-            ].map((c) => (
-              <div
-                key={c.label}
-                className="bg-[var(--card)] border border-[var(--card-border)] rounded-xl p-4"
-              >
-                <p className="text-xs text-[var(--muted)] mb-1">{c.label}</p>
-                <p
-                  className="text-2xl font-bold font-mono"
-                  style={{ color: c.color }}
-                >
-                  {c.val.toFixed(1)}
-                  <span className="text-sm font-normal ml-0.5">{c.unit}</span>
+        {/* ── Error banner ─────────────────────────────── */}
+        {error && (
+          <div className="px-4 py-3 rounded-2xl text-sm flex items-center gap-2"
+            style={{ background: "var(--amber-bg)", border: "1px solid rgba(212,124,46,0.25)", color: "var(--amber)" }}>
+            <span>⚠️</span>
+            <span>{error}{isDummy && " (data contoh)"}</span>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════
+            TAB: DASHBOARD
+        ══════════════════════════════════════════════════ */}
+        {tab === "dashboard" && (
+          <div className="space-y-5">
+
+            {/* Title + status */}
+            <div className="fade-up">
+              <h1 className="text-3xl font-bold tracking-tight" style={{ color: "var(--foreground)" }}>
+                Kondisi <span style={{ color: "var(--brown)" }}>Inkubator</span> Sekarang
+              </h1>
+              <div className="flex items-center gap-2 mt-2">
+                <StatusPing ok={isOnline} />
+                <span className="text-sm" style={{ color: "var(--muted)" }}>
+                  {loading ? "Menyambungkan..." : isOnline ? "Sensor aktif · update tiap 5 detik" : "Sensor offline atau belum ada data"}
+                </span>
+              </div>
+            </div>
+
+            {/* Emergency banner */}
+            {temp >= EMERGENCY && (
+              <div className="px-5 py-3 rounded-2xl font-semibold text-sm fade-up"
+                style={{ background: "rgba(192,57,43,0.1)", border: "1px solid rgba(192,57,43,0.3)", color: "var(--warm-red)" }}>
+                🚨 EMERGENCY — Suhu {temp.toFixed(1)}°C ≥ {EMERGENCY}°C! Heater dimatikan paksa, fan FULL.
+              </div>
+            )}
+
+            {/* 4 stat cards */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 fade-up-1">
+              {[
+                { label: "Suhu",     value: temp.toFixed(1),    unit: "°C", color: "#c0392b", bg: "var(--warm-red-bg)"  },
+                { label: "Humidity", value: hum.toFixed(1),     unit: "%",  color: "#2e7d6b", bg: "var(--teal-bg)"      },
+                { label: "Heater",   value: heaterPwm.toString(), unit: "PWM", color: "#d47c2e", bg: "var(--amber-bg)"  },
+                { label: "Fan",      value: fanPwm.toString(),    unit: "PWM", color: "#8b5e3c", bg: "var(--brown-bg)"  },
+              ].map((c) => (
+                <div key={c.label} className="rounded-2xl p-5 transition-all duration-300 hover:-translate-y-0.5"
+                  style={{ background: "var(--card-bg)", border: `1px solid ${c.bg}`, boxShadow: `0 4px 20px ${c.bg}` }}>
+                  <p className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--muted)" }}>{c.label}</p>
+                  <p className="text-2xl font-bold mt-1" style={{ color: c.color }}>
+                    {c.value}<span className="text-sm font-normal ml-1">{c.unit}</span>
+                  </p>
+                </div>
+              ))}
+            </div>
+
+            {/* Aktuator detail */}
+            <div className="rounded-3xl p-6 fade-up-2"
+              style={{ background: "var(--card-bg)", border: "1px solid var(--brown-border)", boxShadow: "0 4px 24px var(--brown-bg)" }}>
+              <p className="text-xs font-semibold uppercase tracking-wider mb-5" style={{ color: "var(--muted)" }}>Aktuator</p>
+              <div className="space-y-5">
+                <div>
+                  <div className="flex justify-between text-sm mb-1.5">
+                    <span style={{ color: "var(--foreground)" }}>🔥 Heater</span>
+                    <span className="font-mono font-bold" style={{ color: "#c0392b" }}>{heaterPwm} / 255</span>
+                  </div>
+                  <PwmBar value={heaterPwm} color="#c0392b" />
+                </div>
+                <div>
+                  <div className="flex justify-between text-sm mb-1.5">
+                    <span style={{ color: "var(--foreground)" }}>💨 Fan</span>
+                    <span className="font-mono font-bold" style={{ color: "#2e7d6b" }}>{fanPwm} / 255</span>
+                  </div>
+                  <PwmBar value={fanPwm} color="#2e7d6b" />
+                </div>
+                <div className="flex justify-between text-xs pt-3" style={{ borderTop: "1px solid var(--brown-border)", color: "var(--muted)" }}>
+                  <span>Setpoint: <b style={{ color: "var(--foreground)" }}>{SETPOINT}°C</b></span>
+                  <span>Error: <b style={{ color: error_val >= 0 ? "#c0392b" : "#2e7d6b" }}>{error_val >= 0 ? "+" : ""}{error_val.toFixed(2)}</b></span>
+                  <span>Emergency cutoff: <b style={{ color: "var(--warm-red)" }}>{EMERGENCY}°C</b></span>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════
+            TAB: FUZZY LOGIC
+        ══════════════════════════════════════════════════ */}
+        {tab === "fuzzy" && (
+          <div className="space-y-5">
+
+            <div className="fade-up">
+              <h1 className="text-3xl font-bold tracking-tight" style={{ color: "var(--foreground)" }}>
+                Logika <span style={{ color: "var(--brown)" }}>Fuzzy</span> Controller
+              </h1>
+              <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>Metode Mamdani · Defuzzifikasi Center of Gravity</p>
+            </div>
+
+            {/* Alur */}
+            <div className="rounded-3xl p-6 fade-up"
+              style={{ background: "var(--card-bg)", border: "1px solid var(--brown-border)" }}>
+              <p className="text-xs font-semibold uppercase tracking-wider mb-4" style={{ color: "var(--muted)" }}>Alur Kerja</p>
+              <div className="flex flex-wrap gap-2 items-center">
+                {["DHT22 → Suhu", "Error = SP − T", "Fuzzifikasi", "15 Rules (Mamdani)", "Defuzzifikasi (COG)", "PWM Heater & Fan"].map((s, i, arr) => (
+                  <span key={i} className="flex items-center gap-2">
+                    <span className="px-3 py-1.5 rounded-xl text-xs font-medium"
+                      style={{ background: "var(--brown-bg)", color: "var(--brown)", border: "1px solid var(--brown-border)" }}>
+                      {s}
+                    </span>
+                    {i < arr.length - 1 && <span style={{ color: "var(--muted)" }}>→</span>}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {/* MF Error */}
+            <div className="rounded-3xl overflow-hidden fade-up-1"
+              style={{ background: "var(--card-bg)", border: "1px solid var(--brown-border)" }}>
+              <div className="px-6 py-4" style={{ borderBottom: "1px solid var(--brown-border)" }}>
+                <p className="font-semibold text-sm">Membership Function — Error <span style={{ color: "var(--muted)", fontWeight: 400 }}>(Setpoint − Suhu)</span></p>
+              </div>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs uppercase tracking-wider" style={{ color: "var(--muted)", borderBottom: "1px solid var(--brown-border)" }}>
+                    <th className="px-6 py-3">Label</th>
+                    <th className="px-6 py-3">Nama</th>
+                    <th className="px-6 py-3">Makna</th>
+                    <th className="px-6 py-3 font-mono">Fungsi</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ERROR_MF.map((r) => (
+                    <tr key={r.label} style={{ borderTop: "1px solid rgba(139,94,60,0.07)", background: r.label === eZone ? "var(--brown-bg)" : undefined }}>
+                      <td className="px-6 py-3 font-bold" style={{ color: "var(--brown)" }}>{r.label}</td>
+                      <td className="px-6 py-3">{r.name}</td>
+                      <td className="px-6 py-3 text-xs" style={{ color: "var(--muted)" }}>{r.desc}</td>
+                      <td className="px-6 py-3 font-mono text-xs">{r.fn}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="px-6 py-2 text-xs" style={{ color: "var(--muted)", borderTop: "1px solid var(--brown-border)" }}>
+                Baris highlight = zona error aktif saat ini
+              </p>
+            </div>
+
+            {/* MF Delta */}
+            <div className="rounded-3xl overflow-hidden fade-up-1"
+              style={{ background: "var(--card-bg)", border: "1px solid var(--brown-border)" }}>
+              <div className="px-6 py-4" style={{ borderBottom: "1px solid var(--brown-border)" }}>
+                <p className="font-semibold text-sm">Membership Function — ΔError <span style={{ color: "var(--muted)", fontWeight: 400 }}>(perubahan error)</span></p>
+              </div>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs uppercase tracking-wider" style={{ color: "var(--muted)", borderBottom: "1px solid var(--brown-border)" }}>
+                    <th className="px-6 py-3">Label</th>
+                    <th className="px-6 py-3">Nama</th>
+                    <th className="px-6 py-3">Makna</th>
+                    <th className="px-6 py-3 font-mono">Fungsi</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {DELTA_MF.map((r) => (
+                    <tr key={r.label} style={{ borderTop: "1px solid rgba(139,94,60,0.07)" }}>
+                      <td className="px-6 py-3 font-bold" style={{ color: "#2e7d6b" }}>{r.label}</td>
+                      <td className="px-6 py-3">{r.name}</td>
+                      <td className="px-6 py-3 text-xs" style={{ color: "var(--muted)" }}>{r.desc}</td>
+                      <td className="px-6 py-3 font-mono text-xs">{r.fn}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Rule base */}
+            <div className="rounded-3xl overflow-hidden fade-up-2"
+              style={{ background: "var(--card-bg)", border: "1px solid var(--brown-border)" }}>
+              <div className="px-6 py-4" style={{ borderBottom: "1px solid var(--brown-border)" }}>
+                <p className="font-semibold text-sm">Rule Base — 15 Aturan <span style={{ color: "var(--muted)", fontWeight: 400 }}>IF Error AND ΔError THEN Heater, Fan</span></p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs uppercase tracking-wider" style={{ color: "var(--muted)", borderBottom: "1px solid var(--brown-border)" }}>
+                      <th className="px-5 py-3">Error</th>
+                      <th className="px-5 py-3">ΔError</th>
+                      <th className="px-5 py-3">Heater</th>
+                      <th className="px-5 py-3">Fan</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {RULES.map((r, i) => (
+                      <tr key={i} style={{ borderTop: "1px solid rgba(139,94,60,0.07)", background: r.error === eZone ? "var(--brown-bg)" : undefined }}>
+                        <td className="px-5 py-2.5 font-bold" style={{ color: "var(--brown)" }}>{r.error}</td>
+                        <td className="px-5 py-2.5 font-bold" style={{ color: "#2e7d6b" }}>{r.delta}</td>
+                        <td className="px-5 py-2.5 font-mono text-xs font-semibold" style={{ color: r.hColor }}>{r.heater}</td>
+                        <td className="px-5 py-2.5 font-mono text-xs font-semibold" style={{ color: r.fColor }}>{r.fan}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* COG formula + emergency */}
+            <div className="grid md:grid-cols-2 gap-4 fade-up-2">
+              <div className="rounded-3xl p-6"
+                style={{ background: "var(--card-bg)", border: "1px solid var(--brown-border)" }}>
+                <p className="font-semibold text-sm mb-3">Defuzzifikasi — COG</p>
+                <div className="rounded-xl p-4 font-mono text-xs space-y-1" style={{ background: "var(--brown-bg)" }}>
+                  <p style={{ color: "var(--muted)" }}>{`// Center of Gravity`}</p>
+                  <p>PWM_heater = Σ(μ · H) / Σ(μ)</p>
+                  <p>PWM_fan    = Σ(μ · F) / Σ(μ)</p>
+                  <p className="pt-1" style={{ color: "var(--muted)" }}>μ = min(μ_error, μ_delta)</p>
+                </div>
+              </div>
+              <div className="rounded-3xl p-6"
+                style={{ background: "rgba(192,57,43,0.05)", border: "1px solid rgba(192,57,43,0.2)" }}>
+                <p className="font-semibold text-sm mb-3" style={{ color: "var(--warm-red)" }}>🛑 Emergency Cutoff</p>
+                <p className="text-sm" style={{ color: "var(--muted)" }}>
+                  Jika suhu ≥ <b style={{ color: "var(--warm-red)" }}>42°C</b>, heater langsung
+                  PWM = 0 dan fan paksa PWM = 255 — berjalan <b>di luar</b> logika fuzzy
+                  sebagai lapisan proteksi keras.
                 </p>
               </div>
-            ))}
-          </div>
+            </div>
 
-          {/* Gauges */}
-          <div className="bg-[var(--card)] border border-[var(--card-border)] rounded-xl p-5 flex flex-col gap-4">
-            <h2 className="font-semibold text-sm text-[var(--muted)] uppercase tracking-wider">
-              Aktuator
-            </h2>
-            <Gauge
-              label="Heater"
-              value={latest?.heater ?? 0}
-              max={255}
-              unit=""
-              color="var(--accent)"
-            />
-            <Gauge
-              label="Fan"
-              value={latest?.fan ?? 0}
-              max={255}
-              unit=""
-              color="var(--accent-blue)"
-            />
-            <div className="flex justify-between text-xs text-[var(--muted)] pt-2 border-t border-[var(--card-border)]">
-              <span>
-                Setpoint: <b className="text-[var(--foreground)]">{latest?.setpoint ?? 38}°C</b>
-              </span>
-              <span>
-                Emergency cutoff: <b className="text-[var(--accent-red)]">42°C</b>
-              </span>
-            </div>
           </div>
+        )}
 
-          {/* Log table */}
-          <div className="bg-[var(--card)] border border-[var(--card-border)] rounded-xl overflow-hidden">
-            <div className="px-5 py-3 border-b border-[var(--card-border)]">
-              <h2 className="font-semibold text-sm text-[var(--muted)] uppercase tracking-wider">
-                Riwayat Data (50 terakhir)
-              </h2>
-            </div>
-            <div className="overflow-x-auto max-h-80 overflow-y-auto">
-              <table className="w-full text-sm">
-                <thead className="sticky top-0 bg-[var(--card)]">
-                  <tr className="text-left text-[var(--muted)] text-xs uppercase">
-                    <th className="px-4 py-2">Waktu</th>
-                    <th className="px-4 py-2">Suhu</th>
-                    <th className="px-4 py-2">Humidity</th>
-                    <th className="px-4 py-2">Heater</th>
-                    <th className="px-4 py-2">Fan</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {logs.map((l) => (
-                    <tr
-                      key={l.id}
-                      className="border-t border-[var(--card-border)] hover:bg-white/5"
-                    >
-                      <td className="px-4 py-2 font-mono text-xs text-[var(--muted)]">
-                        {new Date(l.created_at).toLocaleTimeString("id-ID")}
-                      </td>
-                      <td className="px-4 py-2 font-mono">
-                        {l.suhu.toFixed(1)}°C
-                      </td>
-                      <td className="px-4 py-2 font-mono">
-                        {l.humidity.toFixed(0)}%
-                      </td>
-                      <td className="px-4 py-2 font-mono">{l.heater}</td>
-                      <td className="px-4 py-2 font-mono">{l.fan}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {logs.length === 0 && (
-                <p className="text-center text-[var(--muted)] py-8 text-sm">
-                  Belum ada data. Pastikan ESP32 sudah push ke Supabase.
-                </p>
-              )}
-            </div>
-          </div>
-        </>
-      )}
+        {/* ══════════════════════════════════════════════════
+            TAB: RIWAYAT
+        ══════════════════════════════════════════════════ */}
+        {tab === "riwayat" && (
+          <RiwayatTab />
+        )}
 
-      {/* ── FUZZY LOGIC KNOWLEDGE ─────────────── */}
-      {tab === "fuzzy" && (
-        <div className="flex flex-col gap-6">
-          {/* Diagram alir */}
-          <div className="bg-[var(--card)] border border-[var(--card-border)] rounded-xl p-5">
-            <h2 className="font-semibold mb-3">📐 Alur Fuzzy Logic Controller</h2>
-            <div className="flex flex-wrap items-center justify-center gap-3 text-sm font-mono">
-              {["DHT22 → Suhu", "→ Error = SP − Suhu", "→ Fuzzifikasi", "→ Inferensi (15 Rules)", "→ Defuzzifikasi (COG)", "→ PWM Heater & Fan"].map(
-                (s, i) => (
-                  <span
-                    key={i}
-                    className="bg-[var(--background)] px-3 py-1.5 rounded-lg border border-[var(--card-border)] text-xs"
-                  >
-                    {s}
-                  </span>
-                )
-              )}
-            </div>
-          </div>
+      </main>
 
-          {/* Membership Error */}
-          <div className="bg-[var(--card)] border border-[var(--card-border)] rounded-xl overflow-hidden">
-            <div className="px-5 py-3 border-b border-[var(--card-border)]">
-              <h2 className="font-semibold text-sm">
-                📊 Membership Function — Error (Setpoint − Suhu)
-              </h2>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-[var(--muted)] text-xs uppercase">
-                    <th className="px-4 py-2">Label</th>
-                    <th className="px-4 py-2">Nama</th>
-                    <th className="px-4 py-2">Arti</th>
-                    <th className="px-4 py-2 font-mono">Parameter</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {MEMBERSHIP_ERROR.map(([label, name, desc, param]) => (
-                    <tr
-                      key={label}
-                      className="border-t border-[var(--card-border)]"
-                    >
-                      <td className="px-4 py-2 font-bold text-[var(--accent)]">
-                        {label}
-                      </td>
-                      <td className="px-4 py-2">{name}</td>
-                      <td className="px-4 py-2 text-[var(--muted)]">{desc}</td>
-                      <td className="px-4 py-2 font-mono text-xs">{param}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* Membership Delta */}
-          <div className="bg-[var(--card)] border border-[var(--card-border)] rounded-xl overflow-hidden">
-            <div className="px-5 py-3 border-b border-[var(--card-border)]">
-              <h2 className="font-semibold text-sm">
-                📊 Membership Function — Delta Error (ΔError)
-              </h2>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-[var(--muted)] text-xs uppercase">
-                    <th className="px-4 py-2">Label</th>
-                    <th className="px-4 py-2">Nama</th>
-                    <th className="px-4 py-2">Arti</th>
-                    <th className="px-4 py-2 font-mono">Parameter</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {MEMBERSHIP_DELTA.map(([label, name, desc, param]) => (
-                    <tr
-                      key={label}
-                      className="border-t border-[var(--card-border)]"
-                    >
-                      <td className="px-4 py-2 font-bold text-[var(--accent-blue)]">
-                        {label}
-                      </td>
-                      <td className="px-4 py-2">{name}</td>
-                      <td className="px-4 py-2 text-[var(--muted)]">{desc}</td>
-                      <td className="px-4 py-2 font-mono text-xs">{param}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* Rule Base Table */}
-          <div className="bg-[var(--card)] border border-[var(--card-border)] rounded-xl overflow-hidden">
-            <div className="px-5 py-3 border-b border-[var(--card-border)]">
-              <h2 className="font-semibold text-sm">
-                📋 Rule Base — 15 Aturan Fuzzy (Mamdani)
-              </h2>
-              <p className="text-xs text-[var(--muted)] mt-1">
-                Baris = Error, Kolom = ΔError. H = Heater level, F = Fan level.
-              </p>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm text-center">
-                <thead>
-                  <tr>
-                    {RULE_TABLE[0].map((h, i) => (
-                      <th
-                        key={i}
-                        className="px-4 py-2 text-[var(--muted)] text-xs uppercase font-bold"
-                      >
-                        {h || "Error \\ ΔErr"}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {RULE_TABLE.slice(1).map((row, ri) => (
-                    <tr
-                      key={ri}
-                      className="border-t border-[var(--card-border)]"
-                    >
-                      {row.map((cell, ci) => (
-                        <td
-                          key={ci}
-                          className={`px-4 py-2 font-mono text-xs ${ci === 0 ? "font-bold text-[var(--accent)]" : ""}`}
-                        >
-                          {cell}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* PWM Mapping */}
-          <div className="bg-[var(--card)] border border-[var(--card-border)] rounded-xl overflow-hidden">
-            <div className="px-5 py-3 border-b border-[var(--card-border)]">
-              <h2 className="font-semibold text-sm">🔧 PWM Level Mapping</h2>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <tbody>
-                  {PWM_MAP.map((row, ri) => (
-                    <tr
-                      key={ri}
-                      className="border-t border-[var(--card-border)]"
-                    >
-                      {row.map((cell, ci) => (
-                        <td
-                          key={ci}
-                          className={`px-4 py-2 ${ci === 0 ? "font-bold text-[var(--accent)]" : "font-mono text-xs"}`}
-                        >
-                          {cell}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* Defuzzifikasi */}
-          <div className="bg-[var(--card)] border border-[var(--card-border)] rounded-xl p-5">
-            <h2 className="font-semibold mb-2">⚙️ Defuzzifikasi — Center of Gravity</h2>
-            <div className="bg-[var(--background)] rounded-lg p-4 font-mono text-xs leading-relaxed">
-              <p className="text-[var(--accent)]">{'// Mamdani + COG'}</p>
-              <p>PWM_heater = Σ(μ × PWM_level) / Σ(μ)</p>
-              <p>PWM_fan = Σ(μ × PWM_level) / Σ(μ)</p>
-              <p className="mt-2 text-[var(--muted)]">
-                μ = min(μ_error, μ_delta) untuk setiap rule yang aktif
-              </p>
-            </div>
-          </div>
-
-          {/* Safety */}
-          <div className="bg-red-900/20 border border-red-800 rounded-xl p-5">
-            <h2 className="font-semibold mb-2 text-[var(--accent-red)]">
-              🛑 Emergency Cutoff
-            </h2>
-            <p className="text-sm text-[var(--muted)]">
-              Jika suhu ≥ <b className="text-[var(--accent-red)]">42°C</b>,
-              heater langsung dimatikan (PWM = 0) dan fan dipaksa maksimal (PWM
-              = 255). Proteksi ini berjalan <b>di luar</b> logika fuzzy sebagai
-              hard safety layer.
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* ── FIRMWARE CODE ─────────────────────── */}
-      {tab === "firmware" && (
-        <div className="bg-[var(--card)] border border-[var(--card-border)] rounded-xl overflow-hidden">
-          <div className="px-5 py-3 border-b border-[var(--card-border)] flex items-center justify-between">
-            <h2 className="font-semibold text-sm">
-              inkubator_fuzzy.py — ESP32 MicroPython
-            </h2>
-            <span className="text-xs text-[var(--muted)] bg-[var(--background)] px-2 py-0.5 rounded">
-              MicroPython
-            </span>
-          </div>
-          <pre className="p-4 overflow-x-auto text-xs leading-relaxed font-mono max-h-[70vh] overflow-y-auto">
-            <code>{FIRMWARE_CODE}</code>
-          </pre>
-        </div>
-      )}
-
-      {/* Footer */}
-      <footer className="text-center text-xs text-[var(--muted)] py-4 border-t border-[var(--card-border)]">
-        Inkubator Telur — Fuzzy Logic Control System · Sinyal dan Sistem Kontrol
-        Elektronik
+      <footer className="text-center text-xs py-8" style={{ color: "var(--muted)", borderTop: "1px solid var(--brown-border)" }}>
+        Inkubator Telur — Fuzzy Logic Control · Sinyal &amp; Sistem Kontrol Elektronik
       </footer>
-    </main>
+    </div>
   );
 }
-
-/* ── firmware source embed ──────────────────────── */
-const FIRMWARE_CODE = `# inkubator_fuzzy.py
-# Target: ESP32 + DHT22 (Pin 4) + Motor Driver MX1508
-# Pin 14 → IN1 (Heater PWM), Pin 5 → IN3 (Fan PWM)
-# LCD I2C: SDA=21, SCL=22
-
-from machine import Pin, PWM, SoftI2C
-import network, urequests, ujson, dht, time
-
-SETPOINT         = 38.0
-EMERGENCY_T      = 42.0
-DHT_PIN          = 4
-HEATER_PIN       = 14
-FAN_PIN          = 5
-SDA_PIN          = 21
-SCL_PIN          = 22
-PWM_FREQ         = 1000
-LOOP_DELAY_MS    = 2000
-PUSH_INTERVAL_MS = 5_000
-PUSH_DELTA_T     = 0.3
-
-SUPABASE_URL = "..."   # ← di .env
-SUPABASE_KEY = "..."   # ← di .env
-WIFI_SSID    = "Mawar1"
-WIFI_PASS    = "mawar119"
-
-sensor = dht.DHT22(Pin(DHT_PIN))
-heater = PWM(Pin(HEATER_PIN), freq=PWM_FREQ)
-fan    = PWM(Pin(FAN_PIN),    freq=PWM_FREQ)
-
-def trimf(x, a, b, c):
-    if x <= a or x >= c: return 0.0
-    if x == b: return 1.0
-    return (x - a) / (b - a) if x < b else (c - x) / (c - b)
-
-def trapmf(x, a, b, c, d):
-    if x <= a or x >= d: return 0.0
-    if b <= x <= c: return 1.0
-    return (x - a) / (b - a) if x < b else (d - x) / (d - c)
-
-def fuzz_error(error):
-    return {
-        "NB": trapmf(error, -8, -5, -3, -2),
-        "NM": trimf(error, -3, -1.5, 0),
-        "Z":  trimf(error, -1, 0, 1),
-        "PM": trimf(error, 0, 1.5, 3),
-        "PB": trapmf(error, 2, 3, 5, 8),
-    }
-
-def fuzz_delta(delta):
-    return {
-        "NF": trapmf(delta, -3, -1.5, -0.3, 0),
-        "Z":  trimf(delta, -0.3, 0, 0.3),
-        "PF": trapmf(delta, 0, 0.3, 1.5, 3),
-    }
-
-RULES = {
-    ("PB","PF"):(4,0), ("PB","Z"):(4,0), ("PB","NF"):(3,0),
-    ("PM","PF"):(3,0), ("PM","Z"):(3,0), ("PM","NF"):(1,2),
-    ("Z","PF"):(1,1),  ("Z","Z"):(1,1),  ("Z","NF"):(0,1),
-    ("NM","PF"):(1,1), ("NM","Z"):(0,2), ("NM","NF"):(0,2),
-    ("NB","PF"):(0,2), ("NB","Z"):(0,2), ("NB","NF"):(0,2),
-}
-HEATER_PWM = {0:0, 1:50, 2:128, 3:192, 4:255}
-FAN_PWM    = {0:0, 1:80, 2:255}
-
-def fuzzy_inference(error, delta):
-    mu_e, mu_d = fuzz_error(error), fuzz_delta(delta)
-    h_n = h_d = f_n = f_d = 0.0
-    for (el,dl),(hl,fl) in RULES.items():
-        s = min(mu_e.get(el,0), mu_d.get(dl,0))
-        if s <= 0: continue
-        h_n += s*HEATER_PWM[hl]; h_d += s
-        f_n += s*FAN_PWM[fl];    f_d += s
-    return (int(h_n/h_d) if h_d else 0,
-            int(f_n/f_d) if f_d else 0)
-
-# ... (lihat source lengkap di repo)`;
